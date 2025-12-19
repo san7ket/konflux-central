@@ -110,14 +110,14 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           path: rhoai-build-config-tekton
 
-      - name: Create branch
+      - name: Prepare branch name
+        id: prepare_branch
         run: |
-          cd rhoai-build-config-tekton
           VERSION_XY=${{ steps.extract_version.outputs.version_xy }}
           BRANCH_NAME="update-fbc-fragment-version-${VERSION_XY}-$(date +%s)"
-          git checkout -b ${BRANCH_NAME}
           echo "BRANCH_NAME=${BRANCH_NAME}" >> $GITHUB_ENV
-          echo "Created branch: ${BRANCH_NAME}"
+          echo "branch_name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          echo "Prepared branch name: ${BRANCH_NAME}"
 
       - name: Install yq
         run: |
@@ -198,7 +198,7 @@ jobs:
           commit-message: "Update FBC fragment version for ${{ github.event.inputs.branch }}"
           committer: Openshift-AI DevOps<openshift-ai-devops@redhat.com>
           author: Openshift-AI DevOps<openshift-ai-devops@redhat.com>
-          branch: ${{ env.BRANCH_NAME }}
+          branch: ${{ steps.prepare_branch.outputs.branch_name }}
           delete-branch: true
           title: "Update FBC fragment version for ${{ github.event.inputs.branch }}"
           body: |
@@ -210,6 +210,7 @@ jobs:
             [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           repository: ${{ env.RBC_REPO }}
           base: main
+          push-to-fork: none
 
       - name: Dry run message for Tekton files
         if: steps.update_files.outputs.FILES_UPDATED > 0 && github.event.inputs.dry_run == 'true'
@@ -236,13 +237,13 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           path: rhoai-build-config-patches
 
-      - name: Create branch
+      - name: Prepare branch name
+        id: prepare_branch_patches
         run: |
-          cd rhoai-build-config-patches
           BRANCH_NAME="update-patches-version-$(echo ${{ env.NEW_VERSION }} | tr '.' '-')-$(date +%s)"
-          git checkout -b ${BRANCH_NAME}
           echo "BRANCH_NAME=${BRANCH_NAME}" >> $GITHUB_ENV
-          echo "Created branch: ${BRANCH_NAME}"
+          echo "branch_name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          echo "Prepared branch name: ${BRANCH_NAME}"
 
       - name: Install yq
         run: |
@@ -316,7 +317,7 @@ jobs:
           commit-message: "Update patch files version to ${{ env.NEW_VERSION }} for ${{ github.event.inputs.branch }}"
           committer: Openshift-AI DevOps<openshift-ai-devops@redhat.com>
           author: Openshift-AI DevOps<openshift-ai-devops@redhat.com>
-          branch: ${{ env.BRANCH_NAME }}
+          branch: ${{ steps.prepare_branch_patches.outputs.branch_name }}
           delete-branch: true
           title: "Update patch files version to ${{ env.NEW_VERSION }} for ${{ github.event.inputs.branch }}"
           body: |
@@ -334,6 +335,7 @@ jobs:
             [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           repository: ${{ env.RBC_REPO }}
           base: ${{ github.event.inputs.branch }}
+          push-to-fork: none
 
       - name: Dry run message for Patch files
         if: github.event.inputs.dry_run == 'true'
