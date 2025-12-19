@@ -1,6 +1,6 @@
 name: Apply Z-Stream Changes
 
-run-name: Applying Z-stream chnanges to ${{ inputs.branch }}
+run-name: Applying Z-stream changes to ${{ inputs.branch }}
 
 on:
   workflow_dispatch:
@@ -14,20 +14,32 @@ on:
         description: 'branch name for which z-stream changes needs to be applied.'
         required: true
         default: 'rhoai-x.y'
+      rbc_repo:
+        type: string
+        description: 'RHOAI-Build-Config repository (for testing use your fork: YOUR_USERNAME/RHOAI-Build-Config)'
+        required: false
+        default: 'red-hat-data-services/RHOAI-Build-Config'
+      github_pat:
+        type: string
+        description: 'GitHub Personal Access Token (required when using a fork for testing, with repo permissions)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   apply-Z-stream-changes:
     runs-on: ubuntu-latest
+    outputs:
+      commit_sha: ${{ steps.get_commit.outputs.sha || github.sha }}
     env:
       branch: ${{ github.event.inputs.branch }}
       PIPELINERUNS_DIR: "pipelineruns"
     steps:
       - name: Validate Inputs
         run: |
-          
           # Validation: branch must follow the "rhoai-x.y" format
           if [[ ! "$branch" =~ ^rhoai-[0-9]+\.[0-9]+$ ]]; then
             echo "Error: branch '$branch' is not in the valid 'rhoai-x.y' format."
@@ -79,5 +91,361 @@ jobs:
           else
             echo "'dry_run' is enabled. No changes will be pushed."
           fi
-      
+
+      - name: Get commit SHA
+        id: get_commit
+        run: |
+          COMMIT_SHA=$(git rev-parse HEAD)
+          echo "sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "Commit SHA: ${COMMIT_SHA}"
+
+  update-rhoai-build-config-tekton:
+    runs-on: ubuntu-latest
+    needs: apply-Z-stream-changes
+    outputs:
+      new_version: ${{ steps.update_files.outputs.new_version }}
+      pr_number: ${{ steps.create_pr_tekton.outputs.number }}
+      pr_url: ${{ steps.create_pr_tekton.outputs.pull-request-url }}
+    env:
+      branch: ${{ github.event.inputs.branch }}
+      RBC_REPO: ${{ github.event.inputs.rbc_repo || 'red-hat-data-services/RHOAI-Build-Config' }}
+      GITHUB_TOKEN: ${{ github.event.inputs.github_pat != '' && github.event.inputs.github_pat || secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout konflux-central script
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref }}
+          path: konflux-script-tekton
+          sparse-checkout: |
+            script/apply-z-stream-changes.sh
+
+      - name: Checkout RHOAI-Build-Config
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RBC_REPO }}
+          ref: main
+          token: ${{ env.GITHUB_TOKEN }}
+          path: rhoai-build-config-tekton
+
+      - name: Install yq
+        run: |
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m | sed 's/x86_64/amd64/')"
+          yq_version="v4.44.3"
+          yq_filename="yq-$yq_version"
+          echo "-> Downloading yq" >&2
+          curl -sSfLo "$yq_filename" "https://github.com/mikefarah/yq/releases/download/$yq_version/yq_${os}_${arch}"
+          chmod +x $yq_filename
+          sudo mv $yq_filename /usr/local/bin/yq
+
+      - name: Update tekton FBC files using script
+        id: update_files
+        run: |
+          chmod +x konflux-script-tekton/script/apply-z-stream-changes.sh
+          mkdir -p /tmp/dummy-pipelineruns
           
+          # Run script to update tekton files
+          konflux-script-tekton/script/apply-z-stream-changes.sh \
+            -b "${{ github.event.inputs.branch }}" \
+            -d /tmp/dummy-pipelineruns \
+            -r "$(pwd)/rhoai-build-config-tekton" \
+            --update-tekton-fbc
+          
+          # Script outputs directly to GITHUB_OUTPUT, verify by checking git status
+          cd rhoai-build-config-tekton
+          FILES_CHANGED=$(git diff --name-only 2>/dev/null | wc -l || echo "0")
+          # Ensure FILES_UPDATED is set (script should have set it, but verify)
+          if ! grep -q "FILES_UPDATED=" $GITHUB_OUTPUT 2>/dev/null; then
+            echo "FILES_UPDATED=${FILES_CHANGED}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Extract version XY and prepare branch name
+        id: prepare_branch
+        run: |
+          # Extract version XY using script function logic
+          VERSION_XY=$(echo "${{ github.event.inputs.branch }}" | sed 's/rhoai-//' | tr -d '.')
+          BRANCH_NAME="update-fbc-fragment-version-${VERSION_XY}-$(date +%s)"
+          echo "version_xy=${VERSION_XY}" >> $GITHUB_OUTPUT
+          echo "BRANCH_NAME=${BRANCH_NAME}" >> $GITHUB_ENV
+          echo "branch_name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          echo "Prepared branch name: ${BRANCH_NAME}"
+
+      - name: Create Pull Request for Tekton files
+        id: create_pr_tekton
+        if: steps.update_files.outputs.FILES_UPDATED > 0 && github.event.inputs.dry_run == 'false'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ env.GITHUB_TOKEN }}
+          path: rhoai-build-config-tekton
+          commit-message: "Update FBC fragment version for ${{ github.event.inputs.branch }}"
+          committer: Openshift-AI DevOps<openshift-ai-devops@redhat.com>
+          author: Openshift-AI DevOps<openshift-ai-devops@redhat.com>
+          branch: ${{ steps.prepare_branch.outputs.branch_name }}
+          delete-branch: true
+          title: "Update FBC fragment version for ${{ github.event.inputs.branch }}"
+          body: |
+            Automated version update for FBC fragment files.
+            
+            Branch: ${{ github.event.inputs.branch }}
+            Version pattern: ${{ steps.prepare_branch.outputs.version_xy }}
+            
+            [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          repository: ${{ env.RBC_REPO }}
+          base: main
+
+      - name: Dry run message for Tekton files
+        if: steps.update_files.outputs.FILES_UPDATED > 0 && github.event.inputs.dry_run == 'true'
+        run: |
+          echo "⚠️  DRY RUN MODE: Changes shown below would be committed but no PR will be created."
+          echo ""
+          cd rhoai-build-config-tekton
+          echo "============================================================================"
+          echo ">> Files Changed"
+          echo "============================================================================"
+          git diff --name-only
+          echo ""
+          echo "============================================================================"
+          echo ">> Changes Summary"
+          echo "============================================================================"
+          git diff --stat
+          echo ""
+          echo "============================================================================"
+          echo ">> Detailed Diff"
+          echo "============================================================================"
+          git diff --color=always || git diff
+
+  update-rhoai-build-config-patches:
+    runs-on: ubuntu-latest
+    needs: update-rhoai-build-config-tekton
+    if: always() && needs.update-rhoai-build-config-tekton.result == 'success'
+    outputs:
+      pr_number: ${{ steps.create_pr_patches.outputs.number }}
+      pr_url: ${{ steps.create_pr_patches.outputs.pull-request-url }}
+    env:
+      branch: ${{ github.event.inputs.branch }}
+      RBC_REPO: ${{ github.event.inputs.rbc_repo || 'red-hat-data-services/RHOAI-Build-Config' }}
+      NEW_VERSION: ${{ needs.update-rhoai-build-config-tekton.outputs.new_version }}
+      GITHUB_TOKEN: ${{ github.event.inputs.github_pat != '' && github.event.inputs.github_pat || secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout RHOAI-Build-Config
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RBC_REPO }}
+          ref: ${{ github.event.inputs.branch }}
+          token: ${{ env.GITHUB_TOKEN }}
+          path: rhoai-build-config-patches
+
+      - name: Checkout konflux-central script
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref }}
+          path: konflux-script-version
+          sparse-checkout: |
+            script/apply-z-stream-changes.sh
+
+      - name: Calculate version using script
+        id: calculate_version
+        run: |
+          chmod +x konflux-script-version/script/apply-z-stream-changes.sh
+          mkdir -p /tmp/dummy-pipelineruns
+          
+          # Run script to calculate version (without -v flag, so it calculates but doesn't update files)
+          # The script will read from patch files and calculate new version
+          # Script outputs to GITHUB_OUTPUT which we'll read
+          konflux-script-version/script/apply-z-stream-changes.sh \
+            -b "${{ github.event.inputs.branch }}" \
+            -d /tmp/dummy-pipelineruns \
+            -r "$(pwd)/rhoai-build-config-patches" \
+            --update-rbc
+          
+          # Script outputs directly to GITHUB_OUTPUT
+          # Outputs will be available in subsequent steps via steps.calculate_version.outputs.*
+          echo "Script execution complete. Version outputs available in next steps."
+
+      - name: Install yq
+        run: |
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m | sed 's/x86_64/amd64/')"
+          yq_version="v4.44.3"
+          yq_filename="yq-$yq_version"
+          echo "-> Downloading yq" >&2
+          curl -sSfLo "$yq_filename" "https://github.com/mikefarah/yq/releases/download/$yq_version/yq_${os}_${arch}"
+          chmod +x $yq_filename
+          sudo mv $yq_filename /usr/local/bin/yq
+
+      - name: Prepare branch name
+        id: prepare_branch_patches
+        run: |
+          BRANCH_NAME="update-patches-version-$(echo ${{ steps.calculate_version.outputs.new_version }} | tr '.' '-')-$(date +%s)"
+          echo "BRANCH_NAME=${BRANCH_NAME}" >> $GITHUB_ENV
+          echo "branch_name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          echo "Prepared branch name: ${BRANCH_NAME}"
+
+      - name: Update RHOAI-Build-Config patch files using script
+        run: |
+          chmod +x konflux-script-version/script/apply-z-stream-changes.sh
+          # Use a dummy directory for -d since it's not needed for RBC-only updates
+          mkdir -p /tmp/dummy-pipelineruns
+          # Pass the calculated version to the script
+          konflux-script-version/script/apply-z-stream-changes.sh \
+            -b "${{ github.event.inputs.branch }}" \
+            -d /tmp/dummy-pipelineruns \
+            -r "$(pwd)/rhoai-build-config-patches" \
+            -v "${{ steps.calculate_version.outputs.new_version }}" \
+            --update-rbc
+
+      - name: Verify changes
+        if: github.event.inputs.dry_run == 'false'
+        run: |
+          cd rhoai-build-config-patches
+          echo "=== Changes Summary ==="
+          git diff --stat
+          echo ""
+          echo "=== Detailed Changes ==="
+          git diff
+
+      - name: Dry run - Show changes for Patch files
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          echo "⚠️  DRY RUN MODE: Changes shown below would be committed but no PR will be created."
+          echo ""
+          cd rhoai-build-config-patches
+          echo "============================================================================"
+          echo ">> Files Changed"
+          echo "============================================================================"
+          git diff --name-only
+          echo ""
+          echo "============================================================================"
+          echo ">> Changes Summary"
+          echo "============================================================================"
+          git diff --stat
+          echo ""
+          echo "============================================================================"
+          echo ">> Detailed Diff"
+          echo "============================================================================"
+          git diff --color=always || git diff
+
+      - name: Create Pull Request for Patch files
+        id: create_pr_patches
+        if: github.event.inputs.dry_run == 'false'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ env.GITHUB_TOKEN }}
+          path: rhoai-build-config-patches
+          commit-message: "Update patch files version to ${{ steps.calculate_version.outputs.new_version }} for ${{ github.event.inputs.branch }}"
+          committer: Openshift-AI DevOps<openshift-ai-devops@redhat.com>
+          author: Openshift-AI DevOps<openshift-ai-devops@redhat.com>
+          branch: ${{ steps.prepare_branch_patches.outputs.branch_name }}
+          delete-branch: true
+          title: "Update patch files version to ${{ steps.calculate_version.outputs.new_version }} for ${{ github.event.inputs.branch }}"
+          body: |
+            Automated version update for patch files.
+            
+            Branch: ${{ github.event.inputs.branch }}
+            Old Version: ${{ steps.calculate_version.outputs.old_version }}
+            New Version: ${{ steps.calculate_version.outputs.new_version }}
+            
+            Changes:
+            - Updated productVersion in config files
+            - Updated version in bundle/bundle-patch.yaml
+            - Updated name, replaces, and skipRange in catalog/catalog-patch.yaml
+            
+            [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          repository: ${{ env.RBC_REPO }}
+          base: ${{ github.event.inputs.branch }}
+
+      - name: Dry run message for Patch files
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          echo "Dry run enabled. Changes would have been made but no PR created."
+          echo "Files that would be updated:"
+          cd rhoai-build-config-patches
+          git diff --name-only
+
+  show-info:
+    runs-on: ubuntu-latest
+    needs: [apply-Z-stream-changes, update-rhoai-build-config-tekton, update-rhoai-build-config-patches]
+    if: always()
+    steps:
+      - name: Show Summary
+        run: |
+          RELEASE_BRANCH="${{ github.event.inputs.branch }}"
+          NEW_VERSION="${{ needs.update-rhoai-build-config-tekton.outputs.new_version || 'N/A' }}"
+          
+          # Get commit SHA - try from job output first, fallback to github.sha
+          COMMIT_SHA="${{ needs.apply-Z-stream-changes.outputs.commit_sha || github.sha }}"
+          
+          # Construct PR URLs
+          RBC_REPO="${{ github.event.inputs.rbc_repo || 'red-hat-data-services/RHOAI-Build-Config' }}"
+          PR1_NUMBER="${{ needs.update-rhoai-build-config-tekton.outputs.pr_number || '' }}"
+          PR2_NUMBER="${{ needs.update-rhoai-build-config-patches.outputs.pr_number || '' }}"
+          
+          # Try to get PR URLs from outputs first
+          PR1_URL="${{ needs.update-rhoai-build-config-tekton.outputs.pr_url || '' }}"
+          PR2_URL="${{ needs.update-rhoai-build-config-patches.outputs.pr_url || '' }}"
+          
+          # Construct PR URLs from numbers if URL not available
+          if [[ -z "$PR1_URL" && -n "$PR1_NUMBER" && "$PR1_NUMBER" != "" ]]; then
+            PR1_URL="https://github.com/${RBC_REPO}/pull/${PR1_NUMBER}"
+          fi
+          
+          if [[ -z "$PR2_URL" && -n "$PR2_NUMBER" && "$PR2_NUMBER" != "" ]]; then
+            PR2_URL="https://github.com/${RBC_REPO}/pull/${PR2_NUMBER}"
+          fi
+          
+          # Construct commit URL for konflux-central
+          if [[ -n "$COMMIT_SHA" && "$COMMIT_SHA" != "" ]]; then
+            COMMIT_URL="https://github.com/${{ github.repository }}/commit/${COMMIT_SHA}"
+            COMMIT_SHORT="${COMMIT_SHA:0:7}"
+          else
+            COMMIT_URL=""
+            COMMIT_SHORT="N/A"
+          fi
+          
+          echo "### 📋 Z-Stream Changes Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Release Branch** | \`${RELEASE_BRANCH}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **New RHOAI Version** | \`${NEW_VERSION}\` |" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ -n "$COMMIT_SHA" && "$COMMIT_SHA" != "" && "$COMMIT_SHA" != "N/A" ]]; then
+            echo "| **Konflux Central Commit** | [\`${COMMIT_SHORT}\`](${COMMIT_URL}) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **Konflux Central Commit** | N/A |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [[ -n "$PR1_URL" && "$PR1_URL" != "" ]]; then
+            echo "| **PR for Tekton FBC** | [PR #${PR1_NUMBER}](${PR1_URL}) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **PR for Tekton FBC** | Not created (dry run or no changes) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [[ -n "$PR2_URL" && "$PR2_URL" != "" ]]; then
+            echo "| **PR for Patches and CSV** | [PR #${PR2_NUMBER}](${PR2_URL}) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **PR for Patches and CSV** | Not created (dry run or no changes) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          
+          # Also print to console with debug info
+          echo "### Z-Stream Changes Summary"
+          echo "Release Branch: ${RELEASE_BRANCH}"
+          echo "New RHOAI Version: ${NEW_VERSION}"
+          echo "Konflux Central Commit: ${COMMIT_SHA:-N/A}"
+          echo "PR for Tekton FBC: ${PR1_URL:-Not created}"
+          echo "PR for Patches and CSV: ${PR2_URL:-Not created}"
+          echo ""
+          echo "Debug info:"
+          echo "  PR1_NUMBER: '${PR1_NUMBER}'"
+          echo "  PR2_NUMBER: '${PR2_NUMBER}'"
+          echo "  COMMIT_SHA from output: '${{ needs.apply-Z-stream-changes.outputs.commit_sha }}'"
+          echo "  PR1_URL from output: '${{ needs.update-rhoai-build-config-tekton.outputs.pr_url }}'"
+          echo "  PR2_URL from output: '${{ needs.update-rhoai-build-config-patches.outputs.pr_url }}'"
+
