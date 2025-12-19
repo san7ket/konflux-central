@@ -189,6 +189,13 @@ jobs:
             echo "new_version=${NEW_VERSION}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Clean up git remotes (if needed)
+        if: steps.update_files.outputs.FILES_UPDATED > 0 && github.event.inputs.dry_run == 'false'
+        run: |
+          cd rhoai-build-config-tekton
+          # Remove fork remote if it exists (action tries to remove it anyway)
+          git remote remove fork 2>/dev/null || true
+
       - name: Create Pull Request for Tekton files
         if: steps.update_files.outputs.FILES_UPDATED > 0 && github.event.inputs.dry_run == 'false'
         uses: peter-evans/create-pull-request@v7
@@ -307,6 +314,13 @@ jobs:
           echo ""
           echo "=== Detailed Changes ==="
           git diff
+
+      - name: Clean up git remotes (if needed)
+        if: github.event.inputs.dry_run == 'false'
+        run: |
+          cd rhoai-build-config-patches
+          # Remove fork remote if it exists (action tries to remove it anyway)
+          git remote remove fork 2>/dev/null || true
 
       - name: Create Pull Request for Patch files
         if: github.event.inputs.dry_run == 'false'
